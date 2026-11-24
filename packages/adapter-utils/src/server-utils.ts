@@ -228,6 +228,7 @@ export const WATCHDOG_DEFAULT_MANDATE = [
   "",
   "Mandate:",
   "- Treat every terminal, cancelled, blocked, in-review, or otherwise stopped leaf in the watched subtree as a claim that must be verified against comments, documents, work products, screenshots, tests, blockers, and review state.",
+  "- A stopped issue marked `[parent]` below has children in the watched subtree, and its own status, assignee, blockers, or waits are part of the stopped state. Verify it the same way, because this wake can come from a parent change while every leaf is unchanged.",
   '- Do not accept "I could not" or "waiting for approval" as automatically valid. Read the evidence before deciding.',
   "- If a stopped leaf is genuinely complete, leave it alone and record why you believe so.",
   "- If a stopped leaf is not genuinely complete, restore a live path inside the watched subtree by reopening, reassigning, commenting actionable instructions, or accepting an eligible task-level interaction (such as a routine plan confirmation when no custom instruction forbids it).",
@@ -1463,6 +1464,7 @@ function normalizePaperclipWakeExecutionPrincipal(
 
 const MAX_WATCHDOG_INSTRUCTIONS_CHARS = 4_000;
 const MAX_WATCHDOG_LEAF_SUMMARIES = 25;
+const MAX_WATCHDOG_PARENT_SUMMARIES = 25;
 const MAX_WATCHDOG_CAPABILITY_ITEMS = 50;
 
 function normalizePaperclipWakeTaskWatchdogLeaf(
@@ -1556,14 +1558,27 @@ function normalizePaperclipWakeTaskWatchdog(
       ? customInstructionsTrimmed.slice(0, MAX_WATCHDOG_INSTRUCTIONS_CHARS)
       : customInstructionsTrimmed
     : null;
-  const terminalLeafSummaries = Array.isArray(watchdog.terminalLeafSummaries)
-    ? watchdog.terminalLeafSummaries
-        .slice(0, MAX_WATCHDOG_LEAF_SUMMARIES)
-        .map((entry) => normalizePaperclipWakeTaskWatchdogLeaf(entry))
-        .filter((entry): entry is PaperclipWakeTaskWatchdogLeaf =>
-          Boolean(entry),
-        )
-    : [];
+  const terminalLeafSummaries: PaperclipWakeTaskWatchdogLeaf[] = [];
+  let parentCount = 0;
+  let leafCount = 0;
+  if (Array.isArray(watchdog.terminalLeafSummaries)) {
+    for (const value of watchdog.terminalLeafSummaries) {
+      const entry = normalizePaperclipWakeTaskWatchdogLeaf(value);
+      if (!entry) continue;
+      if (entry.role === "parent") {
+        if (parentCount >= MAX_WATCHDOG_PARENT_SUMMARIES) continue;
+        parentCount += 1;
+      } else {
+        if (leafCount >= MAX_WATCHDOG_LEAF_SUMMARIES) continue;
+        leafCount += 1;
+      }
+      terminalLeafSummaries.push(entry);
+      if (
+        parentCount === MAX_WATCHDOG_PARENT_SUMMARIES &&
+        leafCount === MAX_WATCHDOG_LEAF_SUMMARIES
+      ) break;
+    }
+  }
   const capabilities = normalizePaperclipWakeTaskWatchdogCapabilities(
     watchdog.capabilities,
   );
