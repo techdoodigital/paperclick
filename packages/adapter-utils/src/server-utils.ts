@@ -10,7 +10,7 @@ import {
   buildLocalProcessSandboxSpawnTarget,
   type LocalProcessSandboxOptions,
 } from "./local-process-sandbox.js";
-import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
+import { buildSshSpawnTarget, type SshRemoteExecutionSpec, type SshProcessCleanup } from "./ssh.js";
 import { redactCommandText } from "./command-redaction.js";
 import { paperclipChatFilePreparationDelivery } from "./chat-file-delivery.js";
 import { withoutModelHiddenRunIds } from "./model-facing-history.js";
@@ -46,6 +46,7 @@ export function buildRuntimeToolsEnv(
 }
 
 export interface RunProcessResult {
+  remoteProcessStopped?: boolean;
   exitCode: number | null;
   signal: string | null;
   timedOut: boolean;
@@ -102,6 +103,7 @@ interface SpawnTarget {
   env?: Record<string, string | undefined>;
   cleanup?: () => Promise<void>;
   stdinPrefix?: string;
+  finish?: (stdoutBytes: number, stderrBytes: number) => Promise<SshProcessCleanup>;
 }
 
 type RemoteExecutionSpec = SshRemoteExecutionSpec;
@@ -3755,6 +3757,7 @@ async function resolveSpawnTarget(
   options: {
     remoteExecution?: RemoteExecutionSpec | null;
     remoteEnv?: Record<string, string> | null;
+    remoteProcessGraceSec?: number;
     localProcessSandbox?: LocalProcessSandboxOptions | null;
   } = {},
 ): Promise<SpawnTarget> {
@@ -3768,6 +3771,7 @@ async function resolveSpawnTarget(
       spec: remote,
       command,
       args,
+      ownedProcessGraceSec: options.remoteProcessGraceSec,
       env: Object.fromEntries(
         Object.entries(options.remoteEnv ?? {}).filter(
           (entry): entry is [string, string] => typeof entry[1] === "string",
@@ -3780,6 +3784,7 @@ async function resolveSpawnTarget(
       cwd: process.cwd(),
       cleanup: spawnTarget.cleanup,
       stdinPrefix: spawnTarget.stdinPrefix,
+      finish: spawnTarget.finish,
     };
   }
 
@@ -4901,6 +4906,7 @@ export async function runChildProcess(
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
       remoteExecution: opts.remoteExecution ?? null,
       remoteEnv: opts.remoteExecution ? opts.env : null,
+      remoteProcessGraceSec: opts.graceSec,
       localProcessSandbox: opts.localProcessSandbox ?? null,
     })
       .then((target) => {
@@ -4941,6 +4947,8 @@ export async function runChildProcess(
         let timedOut = false;
         let stdout = "";
         let stderr = "";
+        let stdoutBytes = 0;
+        let stderrBytes = 0;
         let logChain: Promise<void> = Promise.resolve();
         let terminalResultSeen = false;
         let terminalCleanupStarted = false;
@@ -5036,6 +5044,7 @@ export async function runChildProcess(
           if (!readable) return;
           readable.pause();
           const text = String(chunk);
+          stdoutBytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(text);
           stdout = appendWithCap(stdout, text);
           maybeArmTerminalResultCleanup();
           logChain = logChain
@@ -5054,6 +5063,7 @@ export async function runChildProcess(
           if (!readable) return;
           readable.pause();
           const text = String(chunk);
+          stderrBytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(text);
           stderr = appendWithCap(stderr, text);
           maybeArmTerminalResultCleanup();
           logChain = logChain
@@ -5120,32 +5130,49 @@ export async function runChildProcess(
             if (timeout) clearTimeout(timeout);
             clearTerminalCleanupTimers();
             runningProcesses.delete(runId);
-            void logChain.finally(() => {
-              void Promise.resolve()
-                .then(() => target.cleanup?.())
-                .finally(() => {
-                  resolve({
-                    exitCode: code,
-                    signal,
-                    timedOut,
-                    stdout,
-                    stderr,
-                    pid: child.pid ?? null,
-                    startedAt,
-                    terminalResultCleanup: terminalCleanupStarted
-                      ? {
-                          kind: "terminal_result_cleanup",
-                          stopped: true,
-                          stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
-                          reason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
-                          terminalResultSeen,
-                          signal: terminalCleanupSignal,
-                          forceKilled: terminalCleanupForceKilled,
-                        }
-                      : null,
-                  });
-                });
-            });
+            void (async () => {
+              await logChain;
+              let cleanupResult: SshProcessCleanup | undefined;
+              try {
+                cleanupResult = await target.finish?.(stdoutBytes, stderrBytes);
+                for (const stream of ["stdout", "stderr"] as const) {
+                  const tail = cleanupResult?.[stream];
+                  if (!tail) continue;
+                  if (stream === "stdout") stdout = appendWithCap(stdout, tail);
+                  else stderr = appendWithCap(stderr, tail);
+                  try { await opts.onLog(stream, tail); }
+                  catch (error) { onLogError(error, runId, "failed to append recovered SSH output"); }
+                }
+              } finally {
+                await target.cleanup?.();
+              }
+              const unverified = cleanupResult?.stopped === false;
+              const observedExit = cleanupResult?.outputRecovered && !timedOut && !signal
+                && !terminalCleanupStarted && code !== null && code >= 0 && code < 255;
+              const cleanupFailed = unverified && !observedExit;
+              resolve({
+                exitCode: cleanupFailed ? 1 : code,
+                signal,
+                timedOut,
+                stdout,
+                stderr,
+                pid: child.pid ?? null,
+                startedAt,
+                ...(cleanupResult ? { remoteProcessStopped: cleanupResult.stopped } : {}),
+                ...(cleanupFailed ? { errorCode: "ssh_remote_cleanup_failed" } : {}),
+                terminalResultCleanup: terminalCleanupStarted && !unverified
+                  ? {
+                      kind: "terminal_result_cleanup",
+                      stopped: true,
+                      stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
+                      reason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
+                      terminalResultSeen,
+                      signal: terminalCleanupSignal,
+                      forceKilled: terminalCleanupForceKilled,
+                    }
+                  : null,
+              });
+            })().catch(reject);
           },
         );
       })
