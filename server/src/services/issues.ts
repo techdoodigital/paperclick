@@ -11341,6 +11341,7 @@ export function issueService(db: Db) {
       rows: ImportIssueRow[],
       actorAgentId?: string | null,
       actorCompanyId?: string | null,
+      actorUserId?: string | null,
     ): Promise<void> => {
       if (rows.length === 0) return;
       const isolatedWorkspacesEnabled = (
@@ -11380,6 +11381,7 @@ export function issueService(db: Db) {
 
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, companyId);
         const defaultGoalId = defaultCompanyGoal?.id ?? null;
+        const accessGrants: Array<typeof issueAccessGrants.$inferInsert> = [];
 
         // Project-scoped derivations depend only on the project, so resolve each
         // distinct project once and reuse it across that project's issues.
@@ -11387,6 +11389,7 @@ export function issueService(db: Db) {
           string,
           {
             goalId: string | null;
+            visibility: "open" | "private";
             defaultProjectWorkspaceId: string | null;
             defaultExecutionWorkspaceSettings: Record<string, unknown> | null;
           }
@@ -11397,6 +11400,7 @@ export function issueService(db: Db) {
           const projectRow = await tx
             .select({
               goalId: projects.goalId,
+              visibility: projects.visibility,
               executionWorkspacePolicy: projects.executionWorkspacePolicy,
             })
             .from(projects)
@@ -11422,6 +11426,7 @@ export function issueService(db: Db) {
             ) as Record<string, unknown> | null;
           const derived = {
             goalId: projectRow?.goalId ?? null,
+            visibility: projectRow?.visibility === "private" ? "private" as const : "open" as const,
             defaultProjectWorkspaceId,
             defaultExecutionWorkspaceSettings,
           };
@@ -11431,6 +11436,7 @@ export function issueService(db: Db) {
 
         const validatedAgentIds = new Set<string>();
         const validatedWorkspaceKeys = new Set<string>();
+        const importedPrivacyRoots = new Map<string, string | null>();
         const issueRows: Array<Record<string, unknown>> = [];
         const labelRows: Array<{
           issueId: string;
@@ -11468,9 +11474,11 @@ export function issueService(db: Db) {
             ? (row.executionWorkspaceSettings ?? null)
             : null;
           let projectGoalId: string | null = null;
+          let projectVisibility: "open" | "private" = "open";
           if (projectId) {
             const derived = await loadProjectDerived(projectId);
             projectGoalId = derived.goalId;
+            projectVisibility = derived.visibility;
             if (!projectWorkspaceId)
               projectWorkspaceId = derived.defaultProjectWorkspaceId;
             if (executionWorkspaceSettings == null) {
@@ -11498,9 +11506,38 @@ export function issueService(db: Db) {
             defaultGoalId,
           });
 
+          const parentPrivacyRoot = row.parentId
+            ? importedPrivacyRoots.get(row.parentId) ?? null : null;
+          const visibility = row.visibility === "private"
+            || projectVisibility === "private" || parentPrivacyRoot ? "private" : "open";
+          const privacyRootIssueId = parentPrivacyRoot ?? (visibility === "private" ? row.id : null);
+          importedPrivacyRoots.set(row.id, privacyRootIssueId);
+          if (visibility === "private" && actorUserId) {
+            accessGrants.push({
+              issueId: row.id,
+              subjectType: "user",
+              subjectId: actorUserId,
+              source: "explicit",
+              grantedByUserId: actorUserId,
+            });
+          }
+          if (visibility === "private" && row.assigneeAgentId) {
+            accessGrants.push({
+              issueId: row.id,
+              subjectType: "agent",
+              subjectId: row.assigneeAgentId,
+              source: "assignment",
+              grantedByUserId: actorUserId ?? null,
+              grantedByAgentId: actorAgentId ?? null,
+            });
+          }
+
           issueRows.push({
             id: row.id,
             companyId,
+            visibility,
+            privacyRootIssueId,
+            privacyParentIssueId: row.parentId ?? null,
             issueNumber,
             identifier,
             title: row.title,
@@ -11543,6 +11580,7 @@ export function issueService(db: Db) {
 
         await notifyStatusCardIssueChange(tx, companyId);
         await insertRowsInChunks(tx, issues, issueRows);
+        await insertRowsInChunks(tx, issueAccessGrants, accessGrants);
         await insertRowsInChunks(tx, issueLabels, labelRows);
       });
     },
