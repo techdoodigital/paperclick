@@ -5324,6 +5324,8 @@ export function secretService(db: Db | DbTransaction) {
 
     remove: removeSecretInternal,
 
+    listAdapterSchemaSecretFieldKeys,
+
     normalizeAdapterConfigForPersistence: async (
       companyId: string,
       adapterConfig: Record<string, unknown>,
